@@ -1,5 +1,8 @@
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:open_filex/open_filex.dart';
 
+import '../network/transfer/file_transfer.dart';
 import '../network/transport/connection_manager.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -32,6 +35,19 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.isEmpty) return;
     widget.manager.sendText(widget.peerId, text);
     _controller.clear();
+  }
+
+  Future<void> _pickFile() async {
+    if (!widget.manager.isConnected(widget.peerId)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Not connected yet')),
+      );
+      return;
+    }
+    final result = await FilePicker.platform.pickFiles();
+    final path = result?.files.single.path;
+    if (path == null) return;
+    await widget.manager.sendFile(widget.peerId, path);
   }
 
   @override
@@ -72,9 +88,13 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           SafeArea(
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 4, 4, 8),
+              padding: const EdgeInsets.fromLTRB(4, 4, 4, 8),
               child: Row(
                 children: [
+                  IconButton(
+                    icon: const Icon(Icons.attach_file),
+                    onPressed: _pickFile,
+                  ),
                   Expanded(
                     child: TextField(
                       controller: _controller,
@@ -105,6 +125,8 @@ class _Bubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final file = msg.file;
+
     return Align(
       alignment: msg.mine ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -117,17 +139,80 @@ class _Bubble extends StatelessWidget {
           color: msg.mine ? scheme.primaryContainer : scheme.surfaceContainerHighest,
           borderRadius: BorderRadius.circular(12),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            Text(msg.text),
-            if (msg.mine)
-              Icon(
-                msg.delivered ? Icons.done_all : Icons.access_time,
-                size: 14,
+        child: file != null
+            ? _FileTile(t: file)
+            : Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(msg.text),
+                  if (msg.mine)
+                    Icon(
+                      msg.delivered ? Icons.done_all : Icons.access_time,
+                      size: 14,
+                    ),
+                ],
               ),
+      ),
+    );
+  }
+}
+
+class _FileTile extends StatelessWidget {
+  final FileTransfer t;
+  const _FileTile({required this.t});
+
+  String _fmt(int b) {
+    if (b < 1024) return '$b B';
+    if (b < 1024 * 1024) return '${(b / 1024).toStringAsFixed(1)} KB';
+    if (b < 1024 * 1024 * 1024) {
+      return '${(b / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(b / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
+  String _statusText() {
+    switch (t.status) {
+      case TransferStatus.waiting:
+        return t.outgoing ? 'Waiting for the other phone...' : 'Starting...';
+      case TransferStatus.active:
+        return '${(t.progress * 100).toStringAsFixed(0)}%';
+      case TransferStatus.done:
+        return t.outgoing ? 'Sent' : 'Received - tap to open';
+      case TransferStatus.failed:
+        return 'Failed: ${t.error ?? 'unknown error'}';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final canOpen = t.status == TransferStatus.done && t.path != null;
+
+    return InkWell(
+      onTap: canOpen ? () => OpenFilex.open(t.path!) : null,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.insert_drive_file),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(t.name, maxLines: 2, overflow: TextOverflow.ellipsis),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '${_fmt(t.size)}  -  ${_statusText()}',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          if (t.status == TransferStatus.active) ...[
+            const SizedBox(height: 6),
+            LinearProgressIndicator(value: t.progress),
           ],
-        ),
+        ],
       ),
     );
   }
