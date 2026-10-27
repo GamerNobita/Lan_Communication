@@ -21,11 +21,30 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final TextEditingController _controller = TextEditingController();
 
   @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // After the first frame, so we never update other screens while building.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.manager.openChat(widget.peerId);
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      widget.manager.openChat(widget.peerId);
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    widget.manager.closeChat(widget.peerId);
     _controller.dispose();
     super.dispose();
   }
@@ -63,7 +82,7 @@ class _ChatScreenState extends State<ChatScreen> {
             ValueListenableBuilder<Set<String>>(
               valueListenable: widget.manager.connected,
               builder: (context, ids, child) => Text(
-                ids.contains(widget.peerId) ? 'Connected' : 'Connecting...',
+                ids.contains(widget.peerId) ? 'Connected' : 'Not connected',
                 style: Theme.of(context).textTheme.bodySmall,
               ),
             ),
