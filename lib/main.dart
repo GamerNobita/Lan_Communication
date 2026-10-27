@@ -3,7 +3,7 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 
 import 'core/multicast_lock.dart';
-import 'network/discovery/udp_beacon_discovery.dart';
+import 'network/transport/connection_manager.dart';
 import 'presentation/peers_screen.dart';
 
 Future<void> main() async {
@@ -19,22 +19,17 @@ Future<void> main() async {
   ).join();
   final name = 'Phone-${id.substring(0, 4)}';
 
-  // tcpPort is 0 for now; the chat server comes in the next step.
-  final discovery = UdpBeaconDiscovery(
-    selfId: id,
-    selfName: name,
-    tcpPort: 0,
-  );
-  await discovery.start();
+  final manager = ConnectionManager(selfId: id, selfName: name);
+  await manager.start();
 
-  runApp(MyApp(discovery: discovery, selfName: name));
+  runApp(MyApp(manager: manager, selfName: name));
 }
 
 class MyApp extends StatelessWidget {
-  final UdpBeaconDiscovery discovery;
+  final ConnectionManager manager;
   final String selfName;
 
-  const MyApp({super.key, required this.discovery, required this.selfName});
+  const MyApp({super.key, required this.manager, required this.selfName});
 
   @override
   Widget build(BuildContext context) {
@@ -42,7 +37,7 @@ class MyApp extends StatelessWidget {
       title: 'LAN Messenger',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal),
-      home: PeersScreen(discovery: discovery, selfName: selfName),
+      home: PeersScreen(manager: manager, selfName: selfName),
     );
   }
 }
