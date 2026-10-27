@@ -6,9 +6,9 @@ import 'package:flutter/foundation.dart';
 
 class Peer {
   final String id;
-  final String name;
-  final InternetAddress address;
-  final int port;
+  String name;
+  InternetAddress address;
+  int port;
   DateTime lastSeen;
 
   Peer(this.id, this.name, this.address, this.port) : lastSeen = DateTime.now();
@@ -20,12 +20,17 @@ class UdpBeaconDiscovery {
   static const Duration peerTimeout = Duration(seconds: 10);
 
   final String selfId;
-  final String selfName;
+  String selfName;
   final int tcpPort;
+
+  /// IPs of known contacts. They also get our beacon directly (unicast),
+  /// which still works when the Wi-Fi drops broadcast packets.
+  final Set<String> extraTargets = <String>{};
 
   RawDatagramSocket? _socket;
   Timer? _beaconTimer;
   Timer? _sweepTimer;
+  DateTime _lastSweep = DateTime.now();
   final Map<String, Peer> _peers = {};
 
   /// Live list of nearby devices (UI listens to this).
@@ -93,9 +98,7 @@ class UdpBeaconDiscovery {
       'port': tcpPort,
     }));
 
-    // Send to the general broadcast address AND to each subnet's own
-    // broadcast address (e.g. 192.168.1.255); some networks drop the first.
-    final targets = <String>{'255.255.255.255'};
+    final targets = <String>{'255.255.255.255', ...extraTargets};
     try {
       final ifaces = await NetworkInterface.list(type: InternetAddressType.IPv4);
       for (final i in ifaces) {
@@ -130,12 +133,22 @@ class UdpBeaconDiscovery {
       final id = msg['id'] as String;
       if (id == selfId) return; // our own beacon
 
+      final name = msg['name'] as String;
+      final port = msg['port'] as int;
       final existing = _peers[id];
+
       if (existing != null) {
         existing.lastSeen = DateTime.now();
+        if (existing.name != name ||
+            existing.port != port ||
+            existing.address.address != dg.address.address) {
+          existing.name = name;
+          existing.port = port;
+          existing.address = dg.address;
+          _publish();
+        }
       } else {
-        final name = msg['name'] as String;
-        _peers[id] = Peer(id, name, dg.address, msg['port'] as int);
+        _peers[id] = Peer(id, name, dg.address, port);
         _log('found $name at ${dg.address.address}');
         _publish();
         _announce(); // answer quickly so the other side sees us fast
@@ -146,7 +159,18 @@ class UdpBeaconDiscovery {
   }
 
   void _sweep() {
-    final cutoff = DateTime.now().subtract(peerTimeout);
+    final now = DateTime.now();
+    final slept = now.difference(_lastSweep) > const Duration(seconds: 12);
+    _lastSweep = now;
+    if (slept) {
+      // The phone was asleep: give everyone a fresh chance instead of dropping them.
+      for (final p in _peers.values) {
+        p.lastSeen = now;
+      }
+      return;
+    }
+
+    final cutoff = now.subtract(peerTimeout);
     final before = _peers.length;
     _peers.removeWhere((_, p) {
       final gone = p.lastSeen.isBefore(cutoff);
