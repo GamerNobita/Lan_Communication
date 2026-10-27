@@ -3,8 +3,11 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../../core/native_bridge.dart';
+import '../../data/chat_store.dart';
 import '../discovery/udp_beacon_discovery.dart';
 import '../transfer/file_transfer.dart';
 import 'peer_connection.dart';
@@ -29,16 +32,42 @@ class ChatMessage {
   }) : time = time ?? DateTime.now();
 }
 
+/// One row in the people list.
+class ContactInfo {
+  final String id;
+  final String name;
+  final String? ip;
+  final bool connected;
+  final bool nearby;
+  final int unread;
+  final String lastText;
+  final int lastTs;
+
+  const ContactInfo({
+    required this.id,
+    required this.name,
+    required this.ip,
+    required this.connected,
+    required this.nearby,
+    required this.unread,
+    required this.lastText,
+    required this.lastTs,
+  });
+}
+
 /// Owns the TCP server, the discovery service and all peer connections.
 class ConnectionManager {
-  final String selfId;
-  final String selfName;
+  final ChatStore store;
+  late final ValueNotifier<String> myName;
 
   late final UdpBeaconDiscovery discovery;
   late final FileTransferService _files;
   ServerSocket? _server;
   Timer? _retryTimer;
   final Random _rnd = Random();
+
+  String receivedPath = '';
+  String? openChatPeerId;
 
   final Map<String, PeerConnection> _conns = {};
   final Map<String, InternetAddress> _addrs = {};
@@ -50,9 +79,17 @@ class ConnectionManager {
 
   /// Ids of peers we currently have a live connection with.
   final ValueNotifier<Set<String>> connected = ValueNotifier<Set<String>>({});
+  final ValueNotifier<List<ContactInfo>> contacts =
+      ValueNotifier<List<ContactInfo>>([]);
   final ValueNotifier<List<String>> logs = ValueNotifier<List<String>>([]);
 
-  ConnectionManager({required this.selfId, required this.selfName});
+  ConnectionManager({required this.store}) {
+    myName = ValueNotifier<String>(selfName);
+  }
+
+  String get selfId => store.deviceId;
+  String get selfName => store.nickname ?? 'Phone-${selfId.substring(0, 4)}';
+  bool get hasNickname => store.nickname != null;
 
   void _log(String msg) {
     final t = DateTime.now().toIso8601String().substring(11, 19);
@@ -60,6 +97,8 @@ class ConnectionManager {
   }
 
   Future<void> start() async {
+    _loadAllChats();
+
     // Folder where received files are stored (no permission needed).
     Directory base;
     try {
@@ -70,6 +109,7 @@ class ConnectionManager {
     }
     final dir = Directory('${base.path}/received');
     await dir.create(recursive: true);
+    receivedPath = dir.path;
 
     _files = FileTransferService(
       receiveDir: dir,
@@ -77,7 +117,6 @@ class ConnectionManager {
       log: _log,
     );
     await _files.start();
-    _log('received files go to: ${dir.path}');
 
     final server = await ServerSocket.bind(InternetAddress.anyIPv4, 0);
     _server = server;
@@ -89,11 +128,25 @@ class ConnectionManager {
       selfName: selfName,
       tcpPort: server.port,
     );
+    for (final id in store.contactIds) {
+      final ip = store.contactIp(id);
+      if (ip != null) discovery.extraTargets.add(ip);
+    }
     await discovery.start();
 
-    discovery.peers.addListener(_ensureConnections);
+    discovery.peers.addListener(_onPeersChanged);
     _retryTimer =
         Timer.periodic(const Duration(seconds: 4), (_) => _ensureConnections());
+    _refreshContacts();
+  }
+
+  void _onPeersChanged() {
+    for (final p in discovery.peers.value) {
+      store.upsertContact(p.id, p.name, p.address.address);
+      discovery.extraTargets.add(p.address.address);
+    }
+    _ensureConnections();
+    _refreshContacts();
   }
 
   /// Only the peer with the smaller id dials, so a pair never gets two sockets.
@@ -138,12 +191,17 @@ class ConnectionManager {
           return;
         }
         peerId = id;
+        final name = m['name'] is String
+            ? m['name'] as String
+            : (id.length >= 4 ? id.substring(0, 4) : id);
+
         final old = _conns[id];
         _conns[id] = conn;
         _addrs[id] = socket.remoteAddress;
         old?.close();
+        store.upsertContact(id, name, socket.remoteAddress.address);
         _publishConnected();
-        _log('connected with ${m['name'] ?? id}');
+        _log('connected with $name');
         _flush(id);
         return;
       }
@@ -153,6 +211,12 @@ class ConnectionManager {
         _onChat(conn, id, m);
       } else if (t == 'ack') {
         _onAck(id, m);
+      } else if (t == 'name') {
+        final n = m['name'];
+        if (n is String && n.trim().isNotEmpty) {
+          store.upsertContact(id, n, null);
+          _refreshContacts();
+        }
       } else if (t == 'file_offer') {
         _onFileOffer(conn, id, m);
       } else if (t == 'file_accept') {
@@ -165,12 +229,204 @@ class ConnectionManager {
       if (id != null && identical(_conns[id], conn)) {
         _conns.remove(id);
         _publishConnected();
-        _log('disconnected from $id');
+        _log('disconnected from ${_nameOf(id)}');
       }
     });
   }
 
-  void _publishConnected() => connected.value = _conns.keys.toSet();
+  void _publishConnected() {
+    connected.value = _conns.keys.toSet();
+    _refreshContacts();
+  }
+
+  // --------------------------------------------------------------- nickname
+
+  void setNickname(String name) {
+    final n = name.trim();
+    if (n.isEmpty) return;
+    store.nickname = n;
+    myName.value = n;
+    discovery.selfName = n;
+    for (final c in _conns.values) {
+      c.send({'t': 'name', 'name': n});
+    }
+  }
+
+  void setBackground(bool on) {
+    store.backgroundEnabled = on;
+    if (on) {
+      NativeBridge.startService();
+    } else {
+      NativeBridge.stopService();
+    }
+  }
+
+  String _nameOf(String id) => store.contactName(id) ?? 'Someone';
+
+  // ---------------------------------------------------------------- storage
+
+  Map<String, dynamic> _toRecord(ChatMessage m) {
+    final f = m.file;
+    return {
+      'id': m.id,
+      'mine': m.mine,
+      'text': m.text,
+      'ts': m.time.millisecondsSinceEpoch,
+      'delivered': m.delivered,
+      if (f != null)
+        'file': {
+          'name': f.name,
+          'size': f.size,
+          'path': f.path,
+          'status': f.status.name,
+          'out': f.outgoing,
+          'err': f.error,
+        },
+    };
+  }
+
+  ChatMessage _fromRecord(String peerId, Map<String, dynamic> r) {
+    final id = r['id'] as String;
+    FileTransfer? file;
+    final f = r['file'];
+    if (f is Map) {
+      final size = (f['size'] as int?) ?? 0;
+      var status = TransferStatus.values.firstWhere(
+        (s) => s.name == f['status'],
+        orElse: () => TransferStatus.failed,
+      );
+      String? err = f['err'] as String?;
+      if (status == TransferStatus.waiting || status == TransferStatus.active) {
+        status = TransferStatus.failed;
+        err = 'interrupted';
+      }
+      file = FileTransfer(
+        id: id,
+        peerId: peerId,
+        name: (f['name'] as String?) ?? 'file',
+        size: size,
+        outgoing: (f['out'] as bool?) ?? false,
+        path: f['path'] as String?,
+      );
+      file.status = status;
+      file.error = err;
+      file.transferred = status == TransferStatus.done ? size : 0;
+    }
+    return ChatMessage(
+      id: id,
+      peerId: peerId,
+      mine: (r['mine'] as bool?) ?? false,
+      text: (r['text'] as String?) ?? '',
+      time: DateTime.fromMillisecondsSinceEpoch((r['ts'] as int?) ?? 0),
+      file: file,
+      delivered: (r['delivered'] as bool?) ?? false,
+    );
+  }
+
+  void _persist(ChatMessage m) => store.putMessage(m.peerId, _toRecord(m));
+
+  void _loadAllChats() {
+    _seenIds.clear();
+    for (final peerId in store.chatPeerIds.toList()) {
+      final list = <ChatMessage>[];
+      for (final r in store.messagesOf(peerId)) {
+        final m = _fromRecord(peerId, r);
+        list.add(m);
+        if (!m.mine) _seenIds.add(m.file != null ? 'file-${m.id}' : m.id);
+      }
+      chatFor(peerId).value = list;
+    }
+  }
+
+  String exportBackup() => store.exportJson();
+
+  int importBackup(String json) {
+    final added = store.importJson(json);
+    if (added >= 0) {
+      _loadAllChats();
+      for (final id in store.contactIds) {
+        final ip = store.contactIp(id);
+        if (ip != null) discovery.extraTargets.add(ip);
+      }
+      _refreshContacts();
+    }
+    return added;
+  }
+
+  // --------------------------------------------------------------- contacts
+
+  void _refreshContacts() {
+    final nearby = <String, Peer>{for (final p in discovery.peers.value) p.id: p};
+    final ids = <String>{
+      ...store.contactIds,
+      ...store.chatPeerIds,
+      ...nearby.keys,
+      ..._conns.keys,
+    };
+
+    final list = <ContactInfo>[];
+    for (final id in ids) {
+      if (id == selfId) continue;
+      final msgs = _chats[id]?.value ?? const <ChatMessage>[];
+      final lastRead = store.lastRead(id);
+      var unread = 0;
+      for (final m in msgs) {
+        if (!m.mine && m.time.millisecondsSinceEpoch > lastRead) unread++;
+      }
+      final last = msgs.isEmpty ? null : msgs.last;
+      list.add(ContactInfo(
+        id: id,
+        name: nearby[id]?.name ?? store.contactName(id) ?? 'Unknown',
+        ip: nearby[id]?.address.address ?? store.contactIp(id),
+        connected: _conns.containsKey(id),
+        nearby: nearby.containsKey(id),
+        unread: unread,
+        lastText: last == null
+            ? ''
+            : (last.file != null ? 'File: ${last.text}' : last.text),
+        lastTs: last?.time.millisecondsSinceEpoch ?? 0,
+      ));
+    }
+    list.sort((a, b) {
+      if (a.lastTs != b.lastTs) return b.lastTs.compareTo(a.lastTs);
+      return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    });
+    contacts.value = list;
+  }
+
+  // ------------------------------------------------------------- open chats
+
+  int _notifId(String peerId) => peerId.hashCode & 0x7fffffff;
+
+  void openChat(String peerId) {
+    openChatPeerId = peerId;
+    markRead(peerId);
+  }
+
+  void closeChat(String peerId) {
+    if (openChatPeerId == peerId) openChatPeerId = null;
+  }
+
+  void markRead(String peerId) {
+    store.setLastRead(peerId, DateTime.now().millisecondsSinceEpoch);
+    NativeBridge.cancelNotification(_notifId(peerId));
+    _refreshContacts();
+  }
+
+  bool get _appVisible =>
+      WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+
+  /// Shows a notification unless the user is looking at the app right now.
+  void _notifyIncoming(String peerId, String body) {
+    if (_appVisible) {
+      if (openChatPeerId == peerId) markRead(peerId);
+      return;
+    }
+    final text = body.length > 120 ? '${body.substring(0, 120)}...' : body;
+    NativeBridge.notify(_notifId(peerId), _nameOf(peerId), text);
+  }
+
+  // ------------------------------------------------------------------- chat
 
   ValueNotifier<List<ChatMessage>> chatFor(String peerId) =>
       _chats.putIfAbsent(peerId, () => ValueNotifier<List<ChatMessage>>([]));
@@ -178,12 +434,12 @@ class ConnectionManager {
   void _addMessage(ChatMessage msg) {
     final n = chatFor(msg.peerId);
     n.value = [...n.value, msg];
+    _persist(msg);
+    _refreshContacts();
   }
 
   String _newId() =>
       '${DateTime.now().microsecondsSinceEpoch}-${_rnd.nextInt(1 << 30)}';
-
-  // ------------------------------------------------------------------- chat
 
   void sendText(String peerId, String text) {
     final msg = ChatMessage(id: _newId(), peerId: peerId, mine: true, text: text);
@@ -221,12 +477,16 @@ class ConnectionManager {
     conn.send({'t': 'ack', 'id': id}); // always ack, even duplicates
     if (!_seenIds.add(id)) return; // duplicate from a re-send
     _addMessage(ChatMessage(id: id, peerId: peerId, mine: false, text: text));
+    _notifyIncoming(peerId, text);
   }
 
   void _onAck(String peerId, Map<String, dynamic> m) {
     final n = chatFor(peerId);
     for (final msg in n.value) {
-      if (msg.mine && msg.id == m['id']) msg.delivered = true;
+      if (msg.mine && msg.id == m['id'] && !msg.delivered) {
+        msg.delivered = true;
+        _persist(msg);
+      }
     }
     n.value = List<ChatMessage>.of(n.value);
   }
@@ -274,7 +534,7 @@ class ConnectionManager {
     final name = m['name'];
     final size = m['size'];
     if (tid is! String || name is! String || size is! int) return;
-    if (_expectedOrSeen(tid)) return;
+    if (!_seenIds.add('file-$tid')) return; // already handled
 
     final path = await _files.reserveFile(name);
     final t = FileTransfer(
@@ -295,8 +555,6 @@ class ConnectionManager {
     ));
     conn.send({'t': 'file_accept', 'tid': tid, 'port': _files.port});
   }
-
-  bool _expectedOrSeen(String tid) => !_seenIds.add('file-$tid');
 
   /// Sender: the other side said yes, open the data connection.
   void _onFileAccept(String peerId, Map<String, dynamic> m) {
@@ -320,7 +578,20 @@ class ConnectionManager {
       return;
     }
     _lastTouch[t.id] = now;
+
     final n = chatFor(t.peerId);
     n.value = List<ChatMessage>.of(n.value);
+
+    if (force) {
+      for (final m in n.value) {
+        if (m.id == t.id) {
+          _persist(m);
+          break;
+        }
+      }
+      if (t.status == TransferStatus.done && !t.outgoing) {
+        _notifyIncoming(t.peerId, 'Sent you a file: ${t.name}');
+      }
+    }
   }
 }
