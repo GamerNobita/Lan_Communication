@@ -1,15 +1,19 @@
 import 'package:flutter/material.dart';
 
 import '../network/discovery/udp_beacon_discovery.dart';
+import '../network/transport/connection_manager.dart';
+import 'chat_screen.dart';
 
 class PeersScreen extends StatelessWidget {
-  final UdpBeaconDiscovery discovery;
+  final ConnectionManager manager;
   final String selfName;
 
-  const PeersScreen({super.key, required this.discovery, required this.selfName});
+  const PeersScreen({super.key, required this.manager, required this.selfName});
 
   @override
   Widget build(BuildContext context) {
+    final discovery = manager.discovery;
+
     return Scaffold(
       appBar: AppBar(title: const Text('Nearby devices')),
       body: Column(
@@ -40,7 +44,7 @@ class PeersScreen extends StatelessWidget {
           Expanded(
             child: ValueListenableBuilder<List<Peer>>(
               valueListenable: discovery.peers,
-              builder: (context, peers, _) {
+              builder: (context, peers, child) {
                 if (peers.isEmpty) {
                   return const Center(child: Text('Searching for devices...'));
                 }
@@ -52,6 +56,23 @@ class PeersScreen extends StatelessWidget {
                       leading: const Icon(Icons.smartphone),
                       title: Text(p.name),
                       subtitle: Text(p.address.address),
+                      trailing: ValueListenableBuilder<Set<String>>(
+                        valueListenable: manager.connected,
+                        builder: (context, ids, child) => Icon(
+                          Icons.circle,
+                          size: 14,
+                          color: ids.contains(p.id) ? Colors.green : Colors.grey,
+                        ),
+                      ),
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => ChatScreen(
+                            manager: manager,
+                            peerId: p.id,
+                            peerName: p.name,
+                          ),
+                        ),
+                      ),
                     );
                   },
                 );
@@ -61,16 +82,8 @@ class PeersScreen extends StatelessWidget {
           ExpansionTile(
             title: const Text('Debug log'),
             children: [
-              SizedBox(
-                height: 200,
-                child: ValueListenableBuilder<List<String>>(
-                  valueListenable: discovery.logs,
-                  builder: (context, logs, _) => ListView(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    children: [for (final l in logs) Text(l)],
-                  ),
-                ),
-              ),
+              _LogBox(title: 'Discovery', logs: discovery.logs),
+              _LogBox(title: 'Connections', logs: manager.logs),
             ],
           ),
         ],
@@ -78,3 +91,24 @@ class PeersScreen extends StatelessWidget {
     );
   }
 }
+
+class _LogBox extends StatelessWidget {
+  final String title;
+  final ValueNotifier<List<String>> logs;
+
+  const _LogBox({required this.title, required this.logs});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+          SizedBox(
+            height: 100,
+            child: ValueListenableBuilder<List<String>>(
+              valueListenable: logs,
+              builder: (context, list, child) =>
+                  ListView(
