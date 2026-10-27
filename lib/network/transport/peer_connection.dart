@@ -14,6 +14,7 @@ class PeerConnection {
   final BytesBuilder _buffer = BytesBuilder(copy: false);
   Timer? _heartbeat;
   DateTime _lastRx = DateTime.now();
+  DateTime _lastTick = DateTime.now();
   bool _closed = false;
 
   PeerConnection(this._socket) {
@@ -25,7 +26,15 @@ class PeerConnection {
       cancelOnError: true,
     );
     _heartbeat = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (DateTime.now().difference(_lastRx) > const Duration(seconds: 15)) {
+      final now = DateTime.now();
+      // If this timer fired very late the phone was asleep, so the silence
+      // is not the other side's fault. Start counting again.
+      if (now.difference(_lastTick) > const Duration(seconds: 12)) {
+        _lastRx = now;
+      }
+      _lastTick = now;
+
+      if (now.difference(_lastRx) > const Duration(seconds: 15)) {
         close();
       } else {
         send({'t': 'ping'});
