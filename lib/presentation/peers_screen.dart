@@ -111,4 +111,11 @@ class _LogBox extends StatelessWidget {
             child: ValueListenableBuilder<List<String>>(
               valueListenable: logs,
               builder: (context, list, child) =>
-                  ListView(
+                  ListView(children: [for (final l in list) Text(l)]),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
