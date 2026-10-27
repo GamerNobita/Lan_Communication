@@ -1,0 +1,14 @@
+name: lan_messenger
+description: Offline LAN chat and file sharing.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.3.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
