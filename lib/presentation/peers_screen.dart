@@ -1,75 +1,140 @@
 import 'package:flutter/material.dart';
 
-import '../network/discovery/udp_beacon_discovery.dart';
+import '../core/native_bridge.dart';
 import '../network/transport/connection_manager.dart';
 import 'chat_screen.dart';
+import 'settings_screen.dart';
 
-class PeersScreen extends StatelessWidget {
+class PeersScreen extends StatefulWidget {
   final ConnectionManager manager;
-  final String selfName;
 
-  const PeersScreen({super.key, required this.manager, required this.selfName});
+  const PeersScreen({super.key, required this.manager});
+
+  @override
+  State<PeersScreen> createState() => _PeersScreenState();
+}
+
+class _PeersScreenState extends State<PeersScreen> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _firstRun());
+  }
+
+  Future<void> _firstRun() async {
+    final manager = widget.manager;
+    if (!manager.hasNickname) {
+      final name = await _askNickname();
+      if (name != null) manager.setNickname(name);
+    }
+    await NativeBridge.requestNotificationPermission();
+  }
+
+  Future<String?> _askNickname() {
+    final controller = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Choose a nickname'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 24,
+          decoration: const InputDecoration(hintText: 'Your name'),
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () {
+              final t = controller.text.trim();
+              if (t.isNotEmpty) Navigator.of(ctx).pop(t);
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    final discovery = manager.discovery;
+    final manager = widget.manager;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Nearby devices')),
-      body: Column(
-        children: [
-          Card(
-            margin: const EdgeInsets.all(12),
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('You: $selfName',
-                      style: Theme.of(context).textTheme.titleMedium),
-                  const SizedBox(height: 4),
-                  FutureBuilder<List<String>>(
-                    future: discovery.localIps(),
-                    builder: (context, snap) {
-                      final ips = snap.data ?? [];
-                      return Text(
-                        ips.isEmpty ? 'My IP: (not found)' : 'My IP: ${ips.join(', ')}',
-                      );
-                    },
-                  ),
-                ],
+      appBar: AppBar(
+        title: const Text('LAN Messenger'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => SettingsScreen(manager: manager),
               ),
             ),
           ),
+        ],
+      ),
+      body: Column(
+        children: [
+          ValueListenableBuilder<String>(
+            valueListenable: manager.myName,
+            builder: (context, name, _) => ListTile(
+              leading: const CircleAvatar(child: Icon(Icons.person)),
+              title: Text('You: $name'),
+              subtitle: FutureBuilder<List<String>>(
+                future: manager.discovery.localIps(),
+                builder: (context, snap) {
+                  final ips = snap.data ?? [];
+                  return Text(ips.isEmpty ? 'IP: (not found)' : ips.join(', '));
+                },
+              ),
+            ),
+          ),
+          const Divider(height: 1),
           Expanded(
-            child: ValueListenableBuilder<List<Peer>>(
-              valueListenable: discovery.peers,
-              builder: (context, peers, child) {
-                if (peers.isEmpty) {
+            child: ValueListenableBuilder<List<ContactInfo>>(
+              valueListenable: manager.contacts,
+              builder: (context, list, _) {
+                if (list.isEmpty) {
                   return const Center(child: Text('Searching for devices...'));
                 }
                 return ListView.builder(
-                  itemCount: peers.length,
+                  itemCount: list.length,
                   itemBuilder: (context, i) {
-                    final p = peers[i];
+                    final c = list[i];
+                    final initial = c.name.isEmpty
+                        ? '?'
+                        : String.fromCharCode(c.name.runes.first).toUpperCase();
                     return ListTile(
-                      leading: const Icon(Icons.smartphone),
-                      title: Text(p.name),
-                      subtitle: Text(p.address.address),
-                      trailing: ValueListenableBuilder<Set<String>>(
-                        valueListenable: manager.connected,
-                        builder: (context, ids, child) => Icon(
-                          Icons.circle,
-                          size: 14,
-                          color: ids.contains(p.id) ? Colors.green : Colors.grey,
-                        ),
+                      leading: CircleAvatar(child: Text(initial)),
+                      title: Text(c.name),
+                      subtitle: Text(
+                        c.lastText.isNotEmpty
+                            ? c.lastText
+                            : (c.nearby ? 'Nearby' : 'Offline'),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (c.unread > 0) Badge(label: Text('${c.unread}')),
+                          const SizedBox(width: 8),
+                          Icon(
+                            Icons.circle,
+                            size: 14,
+                            color: c.connected
+                                ? Colors.green
+                                : (c.nearby ? Colors.orange : Colors.grey),
+                          ),
+                        ],
                       ),
                       onTap: () => Navigator.of(context).push(
                         MaterialPageRoute(
                           builder: (_) => ChatScreen(
                             manager: manager,
-                            peerId: p.id,
-                            peerName: p.name,
+                            peerId: c.id,
+                            peerName: c.name,
                           ),
                         ),
                       ),
@@ -77,41 +142,6 @@ class PeersScreen extends StatelessWidget {
                   },
                 );
               },
-            ),
-          ),
-          ExpansionTile(
-            title: const Text('Debug log'),
-            children: [
-              _LogBox(title: 'Discovery', logs: discovery.logs),
-              _LogBox(title: 'Connections', logs: manager.logs),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _LogBox extends StatelessWidget {
-  final String title;
-  final ValueNotifier<List<String>> logs;
-
-  const _LogBox({required this.title, required this.logs});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
-          SizedBox(
-            height: 100,
-            child: ValueListenableBuilder<List<String>>(
-              valueListenable: logs,
-              builder: (context, list, child) =>
-                  ListView(children: [for (final l in list) Text(l)]),
             ),
           ),
         ],
