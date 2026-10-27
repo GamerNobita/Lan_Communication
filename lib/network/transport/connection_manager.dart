@@ -3,8 +3,10 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../discovery/udp_beacon_discovery.dart';
+import '../transfer/file_transfer.dart';
 import 'peer_connection.dart';
 
 class ChatMessage {
@@ -13,6 +15,7 @@ class ChatMessage {
   final bool mine;
   final String text;
   final DateTime time;
+  final FileTransfer? file;
   bool delivered;
 
   ChatMessage({
@@ -21,6 +24,7 @@ class ChatMessage {
     required this.mine,
     required this.text,
     DateTime? time,
+    this.file,
     this.delivered = false,
   }) : time = time ?? DateTime.now();
 }
@@ -31,13 +35,17 @@ class ConnectionManager {
   final String selfName;
 
   late final UdpBeaconDiscovery discovery;
+  late final FileTransferService _files;
   ServerSocket? _server;
   Timer? _retryTimer;
   final Random _rnd = Random();
 
   final Map<String, PeerConnection> _conns = {};
+  final Map<String, InternetAddress> _addrs = {};
   final Set<String> _dialing = {};
   final Set<String> _seenIds = {};
+  final Map<String, FileTransfer> _outgoing = {};
+  final Map<String, DateTime> _lastTouch = {};
   final Map<String, ValueNotifier<List<ChatMessage>>> _chats = {};
 
   /// Ids of peers we currently have a live connection with.
@@ -52,6 +60,25 @@ class ConnectionManager {
   }
 
   Future<void> start() async {
+    // Folder where received files are stored (no permission needed).
+    Directory base;
+    try {
+      base = (await getExternalStorageDirectory()) ??
+          await getApplicationDocumentsDirectory();
+    } catch (_) {
+      base = await getApplicationDocumentsDirectory();
+    }
+    final dir = Directory('${base.path}/received');
+    await dir.create(recursive: true);
+
+    _files = FileTransferService(
+      receiveDir: dir,
+      onChanged: _fileChanged,
+      log: _log,
+    );
+    await _files.start();
+    _log('received files go to: ${dir.path}');
+
     final server = await ServerSocket.bind(InternetAddress.anyIPv4, 0);
     _server = server;
     server.listen(_setup);
@@ -113,6 +140,7 @@ class ConnectionManager {
         peerId = id;
         final old = _conns[id];
         _conns[id] = conn;
+        _addrs[id] = socket.remoteAddress;
         old?.close();
         _publishConnected();
         _log('connected with ${m['name'] ?? id}');
@@ -125,6 +153,10 @@ class ConnectionManager {
         _onChat(conn, id, m);
       } else if (t == 'ack') {
         _onAck(id, m);
+      } else if (t == 'file_offer') {
+        _onFileOffer(conn, id, m);
+      } else if (t == 'file_accept') {
+        _onFileAccept(id, m);
       }
     });
 
@@ -151,6 +183,8 @@ class ConnectionManager {
   String _newId() =>
       '${DateTime.now().microsecondsSinceEpoch}-${_rnd.nextInt(1 << 30)}';
 
+  // ------------------------------------------------------------------- chat
+
   void sendText(String peerId, String text) {
     final msg = ChatMessage(id: _newId(), peerId: peerId, mine: true, text: text);
     _addMessage(msg);
@@ -168,12 +202,14 @@ class ConnectionManager {
     });
   }
 
-  /// Re-send every message of ours that was never acknowledged.
+  /// Re-send every text message of ours that was never acknowledged.
   void _flush(String peerId) {
     final conn = _conns[peerId];
     if (conn == null) return;
     for (final msg in chatFor(peerId).value) {
-      if (msg.mine && !msg.delivered) _sendChat(conn, msg);
+      if (msg.mine && !msg.delivered && msg.file == null) {
+        _sendChat(conn, msg);
+      }
     }
   }
 
@@ -192,6 +228,99 @@ class ConnectionManager {
     for (final msg in n.value) {
       if (msg.mine && msg.id == m['id']) msg.delivered = true;
     }
+    n.value = List<ChatMessage>.of(n.value);
+  }
+
+  // ------------------------------------------------------------------ files
+
+  bool isConnected(String peerId) => _conns.containsKey(peerId);
+
+  /// Sender: announce the file; the data flows after the other side accepts.
+  Future<void> sendFile(String peerId, String path) async {
+    final conn = _conns[peerId];
+    if (conn == null) {
+      _log('cannot send file: not connected');
+      return;
+    }
+    final size = await File(path).length();
+    final name = path.split(RegExp(r'[\\/]')).last;
+
+    final t = FileTransfer(
+      id: _newId(),
+      peerId: peerId,
+      name: name,
+      size: size,
+      outgoing: true,
+      path: path,
+    );
+    _outgoing[t.id] = t;
+    _addMessage(ChatMessage(
+      id: t.id,
+      peerId: peerId,
+      mine: true,
+      text: name,
+      file: t,
+    ));
+    conn.send({'t': 'file_offer', 'tid': t.id, 'name': name, 'size': size});
+  }
+
+  /// Receiver: reserve a file name, expect the data connection, accept.
+  Future<void> _onFileOffer(
+    PeerConnection conn,
+    String peerId,
+    Map<String, dynamic> m,
+  ) async {
+    final tid = m['tid'];
+    final name = m['name'];
+    final size = m['size'];
+    if (tid is! String || name is! String || size is! int) return;
+    if (_expectedOrSeen(tid)) return;
+
+    final path = await _files.reserveFile(name);
+    final t = FileTransfer(
+      id: tid,
+      peerId: peerId,
+      name: name,
+      size: size,
+      outgoing: false,
+      path: path,
+    );
+    _files.expect(t);
+    _addMessage(ChatMessage(
+      id: tid,
+      peerId: peerId,
+      mine: false,
+      text: name,
+      file: t,
+    ));
+    conn.send({'t': 'file_accept', 'tid': tid, 'port': _files.port});
+  }
+
+  bool _expectedOrSeen(String tid) => !_seenIds.add('file-$tid');
+
+  /// Sender: the other side said yes, open the data connection.
+  void _onFileAccept(String peerId, Map<String, dynamic> m) {
+    final tid = m['tid'];
+    final port = m['port'];
+    if (tid is! String || port is! int) return;
+
+    final t = _outgoing[tid];
+    final addr = _addrs[peerId];
+    if (t == null || addr == null || t.peerId != peerId) return;
+    _files.send(t, addr, port);
+  }
+
+  /// Called often during a transfer; refresh the UI at most ~6 times/second.
+  void _fileChanged(FileTransfer t, bool force) {
+    final now = DateTime.now();
+    final last = _lastTouch[t.id];
+    if (!force &&
+        last != null &&
+        now.difference(last) < const Duration(milliseconds: 150)) {
+      return;
+    }
+    _lastTouch[t.id] = now;
+    final n = chatFor(t.peerId);
     n.value = List<ChatMessage>.of(n.value);
   }
 }
