@@ -25,54 +25,356 @@ jobs:
           cp -r build_tmp/android ./android
           rm -rf build_tmp
 
-      - name: Add network permissions
-        run: |
-          M=android/app/src/main/AndroidManifest.xml
-          for P in INTERNET ACCESS_WIFI_STATE CHANGE_WIFI_MULTICAST_STATE ACCESS_NETWORK_STATE; do
-            sed -i "/<manifest /a <uses-permission android:name=\"android.permission.$P\"/>" $M
-          done
-          head -n 12 $M
-
-      - name: Add MulticastLock code to MainActivity
+      - name: Patch AndroidManifest
         run: |
           MAIN=$(find android/app/src/main -name 'MainActivity.kt')
           PKG=$(grep -m1 '^package' "$MAIN" | sed 's/package //')
-          cat > "$MAIN" <<EOF
-          package $PKG
+          export PKG
+          python3 - <<'PY'
+          import os, re
 
-          import android.content.Context
-          import android.net.wifi.WifiManager
+          pkg = os.environ["PKG"]
+          path = "android/app/src/main/AndroidManifest.xml"
+          s = open(path, encoding="utf-8").read()
+
+          perms = [
+              "INTERNET", "ACCESS_NETWORK_STATE", "ACCESS_WIFI_STATE",
+              "CHANGE_WIFI_STATE", "CHANGE_WIFI_MULTICAST_STATE",
+              "CHANGE_NETWORK_STATE", "FOREGROUND_SERVICE",
+              "FOREGROUND_SERVICE_CONNECTED_DEVICE", "POST_NOTIFICATIONS",
+              "WAKE_LOCK", "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+          ]
+          lines = ""
+          for p in perms:
+              tag = "android.permission." + p
+              if tag not in s:
+                  lines += '    <uses-permission android:name="%s"/>\n' % tag
+          s = re.sub(r"(<manifest[^>]*>)", lambda m: m.group(1) + "\n" + lines, s, count=1)
+
+          app_name = pkg + ".LanApp"
+          m = re.search(r"<application[^>]*>", s)
+          old_tag = m.group(0)
+          if "android:name=" in old_tag:
+              new_tag = re.sub(r'android:name="[^"]*"', 'android:name="%s"' % app_name, old_tag, count=1)
+          else:
+              new_tag = old_tag.replace("<application", '<application android:name="%s"' % app_name, 1)
+          s = s.replace(old_tag, new_tag, 1)
+
+          service = '    <service android:name="%s.MessengerService" android:exported="false" android:foregroundServiceType="connectedDevice"/>\n' % pkg
+          s = s.replace("</application>", service + "  </application>", 1)
+
+          open(path, "w", encoding="utf-8").write(s)
+          print(s)
+          PY
+
+      - name: Write Android native code
+        run: |
+          MAIN=$(find android/app/src/main -name 'MainActivity.kt')
+          PKG=$(grep -m1 '^package' "$MAIN" | sed 's/package //')
+          DIR=$(dirname "$MAIN")
+
+          cat > "$DIR/MainActivity.kt" <<'KT'
+          package __PKG__
+
+          import android.os.Bundle
           import io.flutter.embedding.android.FlutterActivity
-          import io.flutter.embedding.engine.FlutterEngine
-          import io.flutter.plugin.common.MethodChannel
 
           class MainActivity : FlutterActivity() {
-              private var lock: WifiManager.MulticastLock? = null
+              // Use the engine that LanApp keeps alive, so chat survives closing the screen.
+              override fun getCachedEngineId(): String? = ENGINE_ID
 
-              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
-                  super.configureFlutterEngine(flutterEngine)
-                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "lan_messenger/multicast")
-                      .setMethodCallHandler { call, result ->
-                          val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                          when (call.method) {
-                              "acquire" -> {
-                                  if (lock == null) {
-                                      lock = wifi.createMulticastLock("lan_messenger")
-                                      lock?.setReferenceCounted(false)
-                                  }
-                                  lock?.acquire()
-                                  result.success(true)
-                              }
-                              "release" -> {
-                                  lock?.let { if (it.isHeld) it.release() }
-                                  result.success(true)
-                              }
-                              else -> result.notImplemented()
-                          }
-                      }
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Bridge.activity = this
+              }
+
+              override fun onStart() {
+                  super.onStart()
+                  Bridge.activity = this
+                  if (Bridge.prefs(this).getBoolean("bg", true)) {
+                      Bridge.startService(this)
+                  }
+              }
+
+              override fun onDestroy() {
+                  if (Bridge.activity === this) Bridge.activity = null
+                  super.onDestroy()
               }
           }
-          EOF
+          KT
+
+          cat > "$DIR/LanNative.kt" <<'KT'
+          package __PKG__
+
+          import android.app.Activity
+          import android.app.Application
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.content.pm.ServiceInfo
+          import android.net.Uri
+          import android.net.wifi.WifiManager
+          import android.os.Build
+          import android.os.IBinder
+          import android.os.PowerManager
+          import android.provider.Settings
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.embedding.engine.FlutterEngineCache
+          import io.flutter.embedding.engine.dart.DartExecutor
+          import io.flutter.plugin.common.MethodChannel
+
+          const val ENGINE_ID = "main"
+
+          /** Starts the Flutter engine once per process and keeps it alive. */
+          class LanApp : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  val engine = FlutterEngine(this)
+                  Bridge.register(this, engine)
+                  engine.dartExecutor.executeDartEntrypoint(
+                      DartExecutor.DartEntrypoint.createDefault()
+                  )
+                  FlutterEngineCache.getInstance().put(ENGINE_ID, engine)
+              }
+          }
+
+          object Notifs {
+              const val SERVICE_CH = "service"
+              const val MESSAGE_CH = "messages"
+              const val SERVICE_ID = 1
+
+              fun ensureChannels(ctx: Context) {
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      nm.createNotificationChannel(
+                          NotificationChannel(SERVICE_CH, "Background connection", NotificationManager.IMPORTANCE_LOW)
+                      )
+                      nm.createNotificationChannel(
+                          NotificationChannel(MESSAGE_CH, "Messages", NotificationManager.IMPORTANCE_HIGH)
+                      )
+                  }
+              }
+
+              private fun builder(ctx: Context, channel: String): Notification.Builder {
+                  return if (Build.VERSION.SDK_INT >= 26) {
+                      Notification.Builder(ctx, channel)
+                  } else {
+                      Notification.Builder(ctx)
+                  }
+              }
+
+              private fun openApp(ctx: Context): PendingIntent {
+                  val launch = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName) ?: Intent()
+                  return PendingIntent.getActivity(
+                      ctx, 0, launch,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+              }
+
+              fun service(ctx: Context): Notification {
+                  return builder(ctx, SERVICE_CH)
+                      .setSmallIcon(android.R.drawable.stat_notify_chat)
+                      .setContentTitle("LAN Messenger")
+                      .setContentText("Running in background")
+                      .setContentIntent(openApp(ctx))
+                      .setOngoing(true)
+                      .build()
+              }
+
+              fun message(ctx: Context, id: Int, title: String, body: String) {
+                  ensureChannels(ctx)
+                  val b = builder(ctx, MESSAGE_CH)
+                      .setSmallIcon(android.R.drawable.stat_notify_chat)
+                      .setContentTitle(title)
+                      .setContentText(body)
+                      .setStyle(Notification.BigTextStyle().bigText(body))
+                      .setAutoCancel(true)
+                      .setContentIntent(openApp(ctx))
+                  if (Build.VERSION.SDK_INT < 26) {
+                      b.setPriority(Notification.PRIORITY_HIGH)
+                      b.setDefaults(Notification.DEFAULT_ALL)
+                  }
+                  try {
+                      val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      nm.notify(id, b.build())
+                  } catch (e: Exception) {
+                  }
+              }
+
+              fun cancel(ctx: Context, id: Int) {
+                  try {
+                      val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      nm.cancel(id)
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+
+          object Bridge {
+              var activity: Activity? = null
+              private var multicast: WifiManager.MulticastLock? = null
+
+              fun prefs(ctx: Context): SharedPreferences =
+                  ctx.getSharedPreferences("lan_native", Context.MODE_PRIVATE)
+
+              fun startService(ctx: Context) {
+                  try {
+                      val i = Intent(ctx, MessengerService::class.java)
+                      if (Build.VERSION.SDK_INT >= 26) {
+                          ctx.startForegroundService(i)
+                      } else {
+                          ctx.startService(i)
+                      }
+                  } catch (e: Exception) {
+                  }
+              }
+
+              fun stopService(ctx: Context) {
+                  try {
+                      ctx.stopService(Intent(ctx, MessengerService::class.java))
+                  } catch (e: Exception) {
+                  }
+              }
+
+              fun register(ctx: Context, engine: FlutterEngine) {
+                  val messenger = engine.dartExecutor.binaryMessenger
+
+                  MethodChannel(messenger, "lan_messenger/multicast").setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "acquire" -> {
+                              if (multicast == null) {
+                                  val wifi = ctx.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                                  multicast = wifi.createMulticastLock("lan_messenger")
+                                  multicast?.setReferenceCounted(false)
+                              }
+                              multicast?.acquire()
+                              result.success(true)
+                          }
+                          "release" -> {
+                              multicast?.let { if (it.isHeld) it.release() }
+                              result.success(true)
+                          }
+                          else -> result.notImplemented()
+                      }
+                  }
+
+                  MethodChannel(messenger, "lan_messenger/native").setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "startService" -> {
+                              prefs(ctx).edit().putBoolean("bg", true).apply()
+                              startService(ctx)
+                              result.success(true)
+                          }
+                          "stopService" -> {
+                              prefs(ctx).edit().putBoolean("bg", false).apply()
+                              stopService(ctx)
+                              result.success(true)
+                          }
+                          "notify" -> {
+                              val id = call.argument<Int>("id") ?: 1
+                              val title = call.argument<String>("title") ?: ""
+                              val body = call.argument<String>("body") ?: ""
+                              Notifs.message(ctx, id, title, body)
+                              result.success(true)
+                          }
+                          "cancelNotification" -> {
+                              val id = call.argument<Int>("id") ?: 1
+                              Notifs.cancel(ctx, id)
+                              result.success(true)
+                          }
+                          "requestNotificationPermission" -> {
+                              val a = activity
+                              if (Build.VERSION.SDK_INT >= 33 && a != null &&
+                                  a.checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED
+                              ) {
+                                  a.requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1001)
+                              }
+                              result.success(true)
+                          }
+                          "requestBatteryExemption" -> {
+                              try {
+                                  val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                                  i.data = Uri.parse("package:" + ctx.packageName)
+                                  val a = activity
+                                  if (a != null) {
+                                      a.startActivity(i)
+                                  } else {
+                                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                      ctx.startActivity(i)
+                                  }
+                              } catch (e: Exception) {
+                              }
+                              result.success(true)
+                          }
+                          "isBatteryExempt" -> {
+                              val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
+                              val exempt = if (Build.VERSION.SDK_INT >= 23) {
+                                  pm.isIgnoringBatteryOptimizations(ctx.packageName)
+                              } else {
+                                  true
+                              }
+                              result.success(exempt)
+                          }
+                          else -> result.notImplemented()
+                      }
+                  }
+              }
+          }
+
+          /** Foreground service: keeps the process (and the chat engine) alive. */
+          class MessengerService : Service() {
+              private var wake: PowerManager.WakeLock? = null
+              private var wifi: WifiManager.WifiLock? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  Notifs.ensureChannels(this)
+                  val n = Notifs.service(this)
+                  try {
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          startForeground(
+                              Notifs.SERVICE_ID, n,
+                              ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                          )
+                      } else {
+                          startForeground(Notifs.SERVICE_ID, n)
+                      }
+                  } catch (e: Exception) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  if (wake == null) {
+                      val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                      wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "lan_messenger:service")
+                      wake?.setReferenceCounted(false)
+                      wake?.acquire()
+                  }
+                  if (wifi == null) {
+                      val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                      wifi = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "lan_messenger:wifi")
+                      wifi?.setReferenceCounted(false)
+                      wifi?.acquire()
+                  }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  wake?.let { if (it.isHeld) it.release() }
+                  wifi?.let { if (it.isHeld) it.release() }
+                  super.onDestroy()
+              }
+          }
+          KT
+
+          sed -i "s/__PKG__/$PKG/g" "$DIR/MainActivity.kt" "$DIR/LanNative.kt"
 
       - run: flutter pub get
 
