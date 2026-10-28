@@ -4,6 +4,8 @@ import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../core/native_bridge.dart';
 import '../network/transport/connection_manager.dart';
@@ -53,19 +55,39 @@ class _SettingsScreenState extends State<SettingsScreen>
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
+  String _backupName() {
+    final date = DateTime.now().toIso8601String().substring(0, 10);
+    return 'lan_messenger_backup_$date.json';
+  }
+
   Future<void> _export() async {
     final json = widget.manager.exportBackup();
     final bytes = Uint8List.fromList(utf8.encode(json));
-    final date = DateTime.now().toIso8601String().substring(0, 10);
     try {
       final path = await FilePicker.platform.saveFile(
         dialogTitle: 'Save chat backup',
-        fileName: 'lan_messenger_backup_$date.json',
+        fileName: _backupName(),
         bytes: bytes,
       );
       _toast(path == null ? 'Export cancelled' : 'Backup saved');
     } catch (e) {
       _toast('Export failed: $e');
+    }
+  }
+
+  /// Opens the Android share sheet, so the backup can go to Google Drive,
+  /// WhatsApp, Telegram, Bluetooth, anything.
+  Future<void> _share() async {
+    try {
+      final dir = await getTemporaryDirectory();
+      final file = File('${dir.path}/${_backupName()}');
+      await file.writeAsString(widget.manager.exportBackup());
+      await Share.shareXFiles(
+        [XFile(file.path)],
+        text: 'LAN Messenger chat backup',
+      );
+    } catch (e) {
+      _toast('Share failed: $e');
     }
   }
 
@@ -122,7 +144,7 @@ class _SettingsScreenState extends State<SettingsScreen>
             title: const Text('Keep running in background'),
             subtitle: const Text(
               'Shows a small notification so Android keeps the app alive '
-              'and you get message alerts',
+              'and you get message alerts. Uses a bit more battery.',
             ),
             value: _bg,
             onChanged: (v) {
@@ -152,8 +174,15 @@ class _SettingsScreenState extends State<SettingsScreen>
           const _Header('Chat backup'),
           ListTile(
             contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.share),
+            title: const Text('Share backup (Drive, WhatsApp...)'),
+            subtitle: const Text('Pick Google Drive in the share menu'),
+            onTap: _share,
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
             leading: const Icon(Icons.upload_file),
-            title: const Text('Export chats'),
+            title: const Text('Export chats to a file'),
             subtitle: const Text('Save all chats as a .json file'),
             onTap: _export,
           ),
